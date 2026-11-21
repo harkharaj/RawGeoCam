@@ -4,6 +4,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.graphics.Rect
 import android.hardware.SensorManager
+import android.location.LocationManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureResult
@@ -37,16 +38,32 @@ object CaptureWriter {
 
     class Input(
         val image: Image,
-        val result: TotalCaptureResult,
+        /** Metadata of the lens that produced [image]: the physical lens's own result when one was selected. */
+        val result: CaptureResult,
+        val totalResult: TotalCaptureResult,
+        /** Characteristics of that same lens. */
         val chars: CameraCharacteristics,
-        val cameraId: String,
+        val lens: CameraController.Lens,
+        val metadataSource: String,
         val isRaw: Boolean,
         val pose: PoseTracker.Snapshot,
         val focusMode: String,
+        val exposureMode: String,
+        val requestedExposureNs: Long?,
+        val requestedIso: Int?,
+        val zoomRatio: Float?,
+        val previewOnPhysical: Boolean,
+        val lensWasMoving: Boolean,
         val captureWallMillis: Long,
     )
 
-    class Output(val baseName: String, val intrinsicsSource: String)
+    class Output(val baseName: String, val intrinsicsSource: String, val qualityIssues: List<String>)
+
+    /** Limits for summary.quality_ok. */
+    private const val MAX_FIX_AGE_S = 30.0
+    private const val MAX_GPS_ACCURACY_M = 20.0
+    private const val MAX_HEADING_ACCURACY_DEG = 10.0
+    private const val MAX_ANGULAR_SPEED_DPS = 5.0
 
     private class Geometry(
         val sensorOrientation: Int,
@@ -79,7 +96,7 @@ object CaptureWriter {
                         } catch (_: IllegalArgumentException) {
                         }
                     }
-                    dng.setDescription("RawGeoCam camera ${input.cameraId}")
+                    dng.setDescription("RawGeoCam ${input.lens.label}")
                     dng.writeImage(out, input.image)
                 } finally {
                     dng.close()
@@ -94,12 +111,14 @@ object CaptureWriter {
             }
         }
 
-        val (json, kSource) = buildJson(input, imageName, geo)
+        val built = buildJson(input, imageName, geo)
         save(context, "$base.json", "application/json") { out ->
-            out.write(json.toString(2).toByteArray(Charsets.UTF_8))
+            out.write(built.json.toString(2).toByteArray(Charsets.UTF_8))
         }
-        return Output(base, kSource)
+        return Output(base, built.intrinsicsSource, built.qualityIssues)
     }
+
+    private class Built(val json: JSONObject, val intrinsicsSource: String, val qualityIssues: List<String>)
 
     // ---------------- geometry ----------------
 
@@ -136,7 +155,7 @@ object CaptureWriter {
 
     // ---------------- JSON ----------------
 
-    private fun buildJson(input: Input, imageName: String, geo: Geometry): Pair<JSONObject, String> {
+    private fun buildJson(input: Input, imageName: String, geo: Geometry): Built {
         val c = input.chars
         val r = input.result
         val pose = input.pose
@@ -151,9 +170,14 @@ object CaptureWriter {
         val h = input.image.height
 
         // ---- intrinsics: Android convention, pre-correction active array, pixel centres at +0.5 ----
+        // r and c both describe the lens that produced the image (the physical lens when one was selected).
         fun valid(k: FloatArray?) = k != null && k.size >= 5 && k[0] > 0f && k[1] > 0f
         val kRes = r.get(CaptureResult.LENS_INTRINSIC_CALIBRATION)
         val kChr = c.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION)
+        val kEstimate = PoseMath.estimateIntrinsics(
+            focal.toDouble(), phys.width.toDouble(), phys.height.toDouble(),
+            pix.width, pix.height, pre.width(), pre.height(),
+        )
         val k: DoubleArray
         val kSource: String
         when {
@@ -164,15 +188,22 @@ object CaptureWriter {
                 k = DoubleArray(5) { kChr!![it].toDouble() }; kSource = "camera_characteristics"
             }
             else -> {
-                k = PoseMath.estimateIntrinsics(
-                    focal.toDouble(), phys.width.toDouble(), phys.height.toDouble(),
-                    pix.width, pix.height, pre.width(), pre.height(),
-                )
+                k = kEstimate
                 kSource = "estimated_from_focal_length_and_sensor_size"
             }
         }
         val (fx, fy, cx, cy) = k.toList()
         val skew = k[4]
+        val check = PoseMath.checkIntrinsics(k, if (focal > 0f) kEstimate[0] else null, pre.width(), pre.height())
+        val bufferOffset = PoseMath.rawBufferOffset(w, h, pre.left, pre.top, pre.width(), pre.height(), pix.width, pix.height)
+        val checkWarnings = check.warnings.toMutableList()
+        if (input.isRaw && bufferOffset == null) {
+            checkWarnings += "RAW buffer ${w}x$h matches neither the pixel array nor the pre-correction array"
+        }
+        if (input.metadataSource == "logical_result_fallback") {
+            checkWarnings += "the phone returned no per-lens metadata for the physical lens; logical-camera values used"
+        }
+        val activePhysical = input.totalResult.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID)
 
         val dRes = r.get(CaptureResult.LENS_DISTORTION)
         val dChr = c.get(CameraCharacteristics.LENS_DISTORTION)
@@ -189,10 +220,10 @@ object CaptureWriter {
         intr.put("model", "pinhole + Brown-Conrady (OpenCV-compatible)")
         intr.put("android_fx_fy_cx_cy_s", arr(fx, fy, cx, cy, skew))
         intr.put("note_android", "Android convention: pixel coordinates in the pre-correction active array, pixel centres at (x+0.5, y+0.5)")
+        var kSummary = doubleArrayOf(fx, fy, cx - 0.5, cy - 0.5)
         if (input.isRaw) {
-            val offX: Int
-            val offY: Int
-            if (w == pre.width() && h == pre.height()) { offX = 0; offY = 0 } else { offX = pre.left; offY = pre.top }
+            val offX = bufferOffset?.get(0) ?: 0
+            val offY = bufferOffset?.get(1) ?: 0
             intr.put("K_opencv_active_area", kOpenCv(fx, fy, cx, cy, skew, 0.0, 0.0))
             intr.put("K_opencv_active_area_size", JSONArray().put(pre.width()).put(pre.height()))
             intr.put("K_opencv_raw_buffer", kOpenCv(fx, fy, cx, cy, skew, offX.toDouble(), offY.toDouble()))
@@ -205,16 +236,33 @@ object CaptureWriter {
                 "Use K_opencv_active_area with rawpy raw_image_visible / postprocess(user_flip=0); " +
                 "K_opencv_raw_buffer with the full raw_image; K_opencv_dng_default_crop with renderers that apply DefaultCrop.")
         } else {
-            val sx = w.toDouble() / pre.width()
-            val sy = h.toDouble() / pre.height()
+            // Processed output: the crop region (pre-correction coordinates while distortion correction is OFF)
+            // is centre-cropped to the JPEG's aspect ratio and scaled uniformly.
+            val crop = r.get(CaptureResult.SCALER_CROP_REGION) ?: Rect(0, 0, pre.width(), pre.height())
+            val kj = PoseMath.processedOutputK(
+                k, crop.left.toDouble(), crop.top.toDouble(), crop.width().toDouble(), crop.height().toDouble(), w, h,
+            )
+            kSummary = doubleArrayOf(kj[0], kj[1], kj[2], kj[3])
             intr.put("K_opencv_image", JSONArray()
-                .put(arr(fx * sx, skew * sx, cx * sx - 0.5))
-                .put(arr(0.0, fy * sy, cy * sy - 0.5))
+                .put(arr(kj[0], kj[4], kj[2]))
+                .put(arr(0.0, kj[1], kj[3]))
                 .put(arr(0.0, 0.0, 1.0)))
             intr.put("K_opencv_image_size", JSONArray().put(w).put(h))
-            intr.put("note_opencv", "APPROXIMATE: JPEG fallback (camera has no RAW). Assumes the JPEG covers the whole pre-correction " +
-                "active array scaled to its size, in sensor orientation (JPEG_ORIENTATION=0).")
+            intr.put("jpeg_crop_region", rectJson(crop))
+            val dcOff = r.get(CaptureResult.DISTORTION_CORRECTION_MODE).let { it == null || it == CameraMetadata.DISTORTION_CORRECTION_MODE_OFF }
+            if (!dcOff) checkWarnings += "JPEG was distortion-corrected by the camera: K and distortion do not describe it"
+            intr.put("note_opencv", "JPEG fallback (camera has no RAW): K derived from the crop region, centre-cropped to the JPEG " +
+                "aspect and scaled. Assumes the HAL honoured JPEG_ORIENTATION=0 (pixels in sensor orientation); if the JPEG " +
+                "looks rotated relative to the DNG convention, this K does not apply.")
         }
+        intr.put("checks", JSONObject().apply {
+            put("fx_over_focal_length_estimate", check.fxOverFocalEstimate ?: JSONObject.NULL)
+            put("focal_length_estimate_fx_px", if (focal > 0f) kEstimate[0] else JSONObject.NULL)
+            put("fy_over_fx", check.fyOverFx)
+            put("principal_point_offset_from_centre_px", arr(check.principalPointOffsetPx[0], check.principalPointOffsetPx[1]))
+            put("warnings", JSONArray().apply { checkWarnings.forEach { put(it) } })
+            put("note", "Factory calibration. To verify, shoot a checkerboard with the same lens and focus and run tools/verify_intrinsics.py")
+        })
         intr.put("distortion_source", dSource)
         if (dist != null) {
             intr.put("distortion_android_kappa1_5", arrF(dist))
@@ -270,7 +318,7 @@ object CaptureWriter {
         img.put("physical_size_mm", arr(phys.width.toDouble(), phys.height.toDouble()))
         if (input.isRaw) {
             img.put("dng_active_area_origin_in_buffer",
-                if (w == pre.width() && h == pre.height()) JSONArray().put(0).put(0) else JSONArray().put(pre.left).put(pre.top))
+                bufferOffset?.let { JSONArray().put(it[0]).put(it[1]) } ?: JSONObject.NULL)
             img.put("dng_default_crop_margin_px", DNG_DEFAULT_CROP_MARGIN)
             img.put("dng_note", "DngCreator also stores the lens-shading GainMap and a WarpRectilinear distortion opcode as METADATA. " +
                 "Adobe/Lightroom apply them when rendering (undistorting the image); rawpy/LibRaw do not.")
@@ -280,6 +328,9 @@ object CaptureWriter {
 
         // ---- exposure ----
         val exp = JSONObject()
+        exp.put("mode", input.exposureMode)
+        exp.put("requested_exposure_time_ns", input.requestedExposureNs ?: JSONObject.NULL)
+        exp.put("requested_iso", input.requestedIso ?: JSONObject.NULL)
         putL(exp, "exposure_time_ns", r.get(CaptureResult.SENSOR_EXPOSURE_TIME))
         putI(exp, "iso", r.get(CaptureResult.SENSOR_SENSITIVITY))
         putL(exp, "frame_duration_ns", r.get(CaptureResult.SENSOR_FRAME_DURATION))
@@ -342,12 +393,43 @@ object CaptureWriter {
         sample.put("angular_speed_dps", pose.angularSpeedDps ?: JSONObject.NULL)
         ori.put("sample", sample)
 
+        // ---- quality: every reason this capture should not be trusted blindly ----
+        val issues = mutableListOf<String>()
+        if (loc == null) {
+            issues += "no_location"
+        } else {
+            if ((pose.locationAgeS ?: Double.MAX_VALUE) > MAX_FIX_AGE_S) issues += "location_fix_older_than_30s"
+            if (!loc.hasAccuracy() || loc.accuracy > MAX_GPS_ACCURACY_M) issues += "location_accuracy_worse_than_20m"
+            if (loc.provider != LocationManager.GPS_PROVIDER) issues += "location_not_from_gps"
+        }
+        if (sa == null) {
+            issues += "no_orientation"
+        } else {
+            if (!geo.trueNorth) issues += "heading_is_magnetic_not_true"
+            if (sa.nearVertical) issues += "near_vertical_heading_unstable"
+        }
+        if (pose.magnetometerAccuracyStatus < SensorManager.SENSOR_STATUS_ACCURACY_MEDIUM) issues += "compass_calibration_low"
+        if ((pose.headingAccuracyDeg ?: 0.0) > MAX_HEADING_ACCURACY_DEG) issues += "heading_accuracy_worse_than_10deg"
+        if (pose.timeReference.contains("clock mismatch")) issues += "pose_not_time_aligned"
+        if ((pose.angularSpeedDps ?: 0.0) > MAX_ANGULAR_SPEED_DPS) issues += "phone_rotating_during_capture"
+        if (kSource.startsWith("estimated")) issues += "intrinsics_estimated_not_calibrated"
+        if (dist == null) issues += "distortion_not_published"
+        if (checkWarnings.isNotEmpty()) issues += "intrinsics_check_warning"
+        if (r.get(CaptureResult.LENS_OPTICAL_STABILIZATION_MODE) == CameraMetadata.LENS_OPTICAL_STABILIZATION_MODE_ON) {
+            issues += "ois_on_principal_point_may_shift"
+        }
+        if (input.lensWasMoving || r.get(CaptureResult.LENS_STATE) == CameraMetadata.LENS_STATE_MOVING) issues += "lens_moving"
+        if (!input.isRaw) issues += "jpeg_not_raw"
+
         // ---- summary first, then details ----
         val root = JSONObject()
         root.put("schema", "rawgeocam/1")
         root.put("image_file", imageName)
         root.put("capture_time_utc", iso(input.captureWallMillis))
         root.put("summary", JSONObject().apply {
+            put("quality_ok", issues.isEmpty())
+            put("quality_issues", JSONArray().apply { issues.forEach { put(it) } })
+            put("lens", input.lens.label)
             put("latitude", loc?.latitude ?: JSONObject.NULL)
             put("longitude", loc?.longitude ?: JSONObject.NULL)
             put("gps_accuracy_m", if (loc != null && loc.hasAccuracy()) loc.accuracy.toDouble() else JSONObject.NULL)
@@ -356,22 +438,23 @@ object CaptureWriter {
             put("pitch_deg", sa?.pitchDeg ?: JSONObject.NULL)
             put("roll_deg_display_frame", da?.rollDeg ?: JSONObject.NULL)
             put("roll_deg_sensor_frame", sa?.rollDeg ?: JSONObject.NULL)
-            if (input.isRaw) {
-                put("fx_fy_cx_cy_opencv_sensor_frame", arr(fx, fy, cx - 0.5, cy - 0.5))
-            } else {
-                val sx = w.toDouble() / pre.width()
-                val sy = h.toDouble() / pre.height()
-                put("fx_fy_cx_cy_opencv_sensor_frame", arr(fx * sx, fy * sy, cx * sx - 0.5, cy * sy - 0.5))
-            }
+            put("fx_fy_cx_cy_opencv_sensor_frame", arr(*kSummary))
             put("intrinsics_source", kSource)
+            put("focus_distance_diopters", r.get(CaptureResult.LENS_FOCUS_DISTANCE)?.toDouble() ?: JSONObject.NULL)
+            put("exposure_mode", input.exposureMode)
         })
         root.put("device", JSONObject()
             .put("manufacturer", Build.MANUFACTURER)
             .put("model", Build.MODEL)
             .put("android_sdk", Build.VERSION.SDK_INT))
         root.put("camera", JSONObject().apply {
-            put("id", input.cameraId)
-            put("active_physical_id", r.get(CaptureResult.LOGICAL_MULTI_CAMERA_ACTIVE_PHYSICAL_ID) ?: JSONObject.NULL)
+            put("id", input.lens.openId)
+            put("physical_id", input.lens.physicalId ?: JSONObject.NULL)
+            put("lens", input.lens.label)
+            put("metadata_source", input.metadataSource)
+            put("preview_stream", if (input.lens.physicalId == null) "logical" else if (input.previewOnPhysical) "physical" else "logical")
+            put("logical_zoom_ratio_requested", input.zoomRatio?.toDouble() ?: JSONObject.NULL)
+            put("active_physical_id", activePhysical ?: JSONObject.NULL)
             put("timestamp_source", if (c.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) ==
                 CameraMetadata.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME) "realtime" else "unknown")
         })
@@ -380,7 +463,7 @@ object CaptureWriter {
         root.put("location", locJson)
         root.put("orientation", ori)
         root.put("exposure", exp)
-        return root to kSource
+        return Built(root, kSource, issues)
     }
 
     private fun frameJson(a: PoseMath.Angles, rWc: DoubleArray, rotCw: Int, exif: Int): JSONObject =

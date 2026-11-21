@@ -1,5 +1,6 @@
 package io.github.harkharaj.rawgeocam
 
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.asin
 import kotlin.math.atan2
@@ -214,6 +215,111 @@ object PoseMath {
         val fx = focalMm * pixelArrayWidth / physicalWidthMm
         val fy = focalMm * pixelArrayHeight / physicalHeightMm
         return doubleArrayOf(fx, fy, activeWidth / 2.0, activeHeight / 2.0, 0.0)
+    }
+
+    // ---------- intrinsics bookkeeping ----------
+
+    /**
+     * Offset of the pre-correction active array inside a RAW buffer of [w] x [h], mirroring DngCreator:
+     * a buffer of exactly the pre-correction size has offset (0, 0); a buffer of the full pixel-array size
+     * has the active array at (preLeft, preTop). Any other size is rejected by DngCreator: returns null.
+     */
+    fun rawBufferOffset(
+        w: Int, h: Int,
+        preLeft: Int, preTop: Int, preWidth: Int, preHeight: Int,
+        pixWidth: Int, pixHeight: Int,
+    ): IntArray? = when {
+        w == preWidth && h == preHeight -> intArrayOf(0, 0)
+        w == pixWidth && h == pixHeight -> intArrayOf(preLeft, preTop)
+        else -> null
+    }
+
+    /**
+     * Which RAW output size to use: one DngCreator accepts (full pixel array first, then the
+     * pre-correction array), otherwise the largest.
+     */
+    fun preferredRawIndex(widths: IntArray, heights: IntArray, pixW: Int, pixH: Int, preW: Int, preH: Int): Int {
+        for (i in widths.indices) if (widths[i] == pixW && heights[i] == pixH) return i
+        for (i in widths.indices) if (widths[i] == preW && heights[i] == preH) return i
+        var best = 0
+        for (i in widths.indices) {
+            if (widths[i].toLong() * heights[i] > widths[best].toLong() * heights[best]) best = i
+        }
+        return best
+    }
+
+    /**
+     * Intrinsics of a PROCESSED output (JPEG) in OpenCV convention, [fx, fy, cx, cy, s].
+     * [k] is Camera2's [fx, fy, cx, cy, s] in the pre-correction array (pixel centres at +0.5).
+     * The output shows the crop region (same coordinate system as [k]) centre-cropped to the output aspect
+     * ratio and scaled uniformly, which is how Camera2 maps the crop region onto a stream.
+     */
+    fun processedOutputK(
+        k: DoubleArray,
+        cropLeft: Double, cropTop: Double, cropWidth: Double, cropHeight: Double,
+        outWidth: Int, outHeight: Int,
+    ): DoubleArray {
+        val outAspect = outWidth.toDouble() / outHeight
+        var offX = cropLeft
+        var offY = cropTop
+        val scale: Double
+        if (cropWidth / cropHeight > outAspect) {
+            val usedWidth = cropHeight * outAspect
+            offX += (cropWidth - usedWidth) / 2.0
+            scale = outHeight / cropHeight
+        } else {
+            val usedHeight = cropWidth / outAspect
+            offY += (cropHeight - usedHeight) / 2.0
+            scale = outWidth / cropWidth
+        }
+        return doubleArrayOf(
+            k[0] * scale,
+            k[1] * scale,
+            (k[2] - offX) * scale - 0.5,
+            (k[3] - offY) * scale - 0.5,
+            k[4] * scale,
+        )
+    }
+
+    class IntrinsicsCheck(
+        /** fx divided by focal_length_mm * pixels-per-mm; ~1.0 when K and the pixel grid agree. */
+        val fxOverFocalEstimate: Double?,
+        val fyOverFx: Double,
+        /** Principal point minus array centre, pixels (same in Android and OpenCV conventions). */
+        val principalPointOffsetPx: DoubleArray,
+        val warnings: List<String>,
+    )
+
+    /**
+     * Sanity checks that catch the usual ways intrinsics end up in the wrong pixel grid
+     * (binned vs full-resolution array, wrong lens of a multi-camera, swapped axes).
+     * [k] = Camera2 [fx, fy, cx, cy, s]; [focalEstimateFx] from focal length and pixel pitch.
+     */
+    fun checkIntrinsics(k: DoubleArray, focalEstimateFx: Double?, arrayWidth: Int, arrayHeight: Int): IntrinsicsCheck {
+        val warnings = mutableListOf<String>()
+        val fx = k[0]
+        val fy = k[1]
+        val cx = k[2]
+        val cy = k[3]
+        if (!(fx > 0.0 && fy > 0.0)) warnings += "non-positive focal length"
+        val fyOverFx = if (fx != 0.0) fy / fx else Double.NaN
+        if (!(abs(fyOverFx - 1.0) <= 0.02)) {
+            warnings += String.format(Locale.US, "fx and fy differ by %.1f%% (phone pixels are square)", (fyOverFx - 1.0) * 100)
+        }
+        val ratio = if (focalEstimateFx != null && focalEstimateFx > 0.0) fx / focalEstimateFx else null
+        if (ratio != null && abs(ratio - 1.0) > 0.10) {
+            warnings += String.format(Locale.US,
+                "fx is %.2fx the focal-length x pixel-pitch estimate (intrinsics may belong to another pixel grid or lens)", ratio)
+        }
+        val dx = cx - arrayWidth / 2.0
+        val dy = cy - arrayHeight / 2.0
+        if (cx < 0.0 || cy < 0.0 || cx > arrayWidth || cy > arrayHeight) {
+            warnings += "principal point lies outside the pixel array"
+        } else if (abs(dx) > 0.1 * arrayWidth || abs(dy) > 0.1 * arrayHeight) {
+            warnings += String.format(Locale.US, "principal point is (%.0f, %.0f) px from the array centre (>10%%)", dx, dy)
+        }
+        if (fx > 0.0 && abs(k[4]) > 1e-3 * fx) warnings += "non-zero skew"
+        return IntrinsicsCheck(ratio, fyOverFx, doubleArrayOf(dx, dy), warnings)
     }
 
     /** Index of the timestamp closest to [t], or -1 if [times] is empty. */
