@@ -11,8 +11,8 @@ android {
         applicationId = "io.github.harkharaj.rawgeocam"
         minSdk = 29          // Android 10: MediaStore Downloads, LENS_DISTORTION, SessionConfiguration
         targetSdk = 34       // keep 34: at 35 Android 15 forces edge-to-edge and the UI would need inset handling
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
     }
 
     buildTypes {
@@ -31,5 +31,8 @@ android {
     }
 }
 
-// No third-party dependencies: only the Android framework (Camera2, SensorManager, LocationManager,
-// DngCreator, MediaStore, org.json) and the Kotlin standard library.
+// No third-party runtime dependencies: only the Android framework (Camera2, SensorManager, LocationManager,
+// DngCreator, MediaStore, org.json) and the Kotlin standard library. JUnit is used for JVM tests only.
+dependencies {
+    testImplementation("junit:junit:4.13.2")
+}

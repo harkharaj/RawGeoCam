@@ -21,6 +21,7 @@ Only numpy is required, plus rawpy for image()/raw_mosaic().
 import json
 import os
 import sys
+import warnings
 
 import numpy as np
 
@@ -116,7 +117,21 @@ class Capture:
 
     def _dist(self):
         d = self.meta["intrinsics"]["distortion_opencv_k1_k2_p1_p2_k3"]
-        return np.zeros(5) if d is None else np.asarray(d, dtype=float)
+        if d is None:
+            warnings.warn(f"{os.path.basename(self.json_path)}: the phone published no distortion for this lens; "
+                          "using zeros (a perfect pinhole), which is wrong for real lenses, especially ultrawides. "
+                          "Calibrate with tools/verify_intrinsics.py.", stacklevel=3)
+            return np.zeros(5)
+        return np.asarray(d, dtype=float)
+
+    @property
+    def quality_ok(self):
+        """False when the app flagged anything (stale/poor GPS, low compass calibration, motion, ...)."""
+        return bool(self.meta.get("summary", {}).get("quality_ok", True))
+
+    @property
+    def quality_issues(self):
+        return list(self.meta.get("summary", {}).get("quality_issues", []))
 
     def intrinsics(self, frame="sensor"):
         """(K, dist, (width, height)) for the active-area image (rawpy raw_image_visible /
@@ -228,7 +243,10 @@ if __name__ == "__main__":
         K, dist, size = cap.intrinsics("display")
         p = cap.pose("display")
         np.set_printoptions(suppress=True, precision=4)
-        print(f"{cap.meta['image_file']}  ({size[0]}x{size[1]} upright)")
+        print(f"{cap.meta['image_file']}  ({size[0]}x{size[1]} upright)  lens: {cap.meta.get('summary', {}).get('lens', '?')}")
+        print("quality:", "OK" if cap.quality_ok else "ISSUES " + ", ".join(cap.quality_issues))
+        for w in cap.meta["intrinsics"].get("checks", {}).get("warnings", []):
+            print("intrinsics check:", w)
         print(f"lat/lon  {p['latitude']}, {p['longitude']}  ±{p['horizontal_accuracy_m']} m")
         print(f"heading {p['heading_deg']:.2f}  pitch {p['pitch_deg']:.2f}  roll {p['roll_deg']:.2f}   [{p['world_frame']}]")
         print("K =\n", K, "\ndist =", dist)
